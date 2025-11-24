@@ -22,7 +22,7 @@ from ..utils import setup_logging
 import lovely_tensors as lt
 lt.monkey_patch()
 
-logger = setup_logging("flash_attn")
+logger = setup_logging("flash_triton")
 
 FLASH_ATTENTION_DOCSTRING = """
 TODO: Make this docstring comprehensive and more clear.
@@ -105,147 +105,6 @@ The final normalization step produces the correct attention output equivalent to
 computing softmax over all key tiles at once.
 """
 
-class FlashAttentionPytorch(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        Q: Float[Tensor, " ... queries d_k"],
-        K: Float[Tensor, " ... keys    d_k"],
-        V: Float[Tensor, " ... keys    d_v"],
-        is_causal: Bool = False,
-        return_attn_probs: Bool = False,
-    ):
-        logger.info("Running Flash Attention 2 Pytorch")
-        n_queries = Q.shape[-2]
-        n_keys = K.shape[-2]
-        d = Q.shape[-1]
-        scale = 1 / (d ** 0.5)
-        Q_TILE_SIZE, K_TILE_SIZE = 16, 32
-        Tq, Tk = math.ceil(n_queries / Q_TILE_SIZE), math.ceil(n_keys / K_TILE_SIZE)
-
-        # Reshaping Q, K, V so that each outer for-loop iteration 
-        # deals with elements from a single batch index
-        original_shape = Q.shape
-        Q = rearrange(Q, "... queries d -> (...) queries d")             # (n_programs, n_queries, d)
-        K = rearrange(K, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
-        V = rearrange(V, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
-        O = torch.zeros(Q.shape, device=Q.device, dtype=Q.dtype)         # (n_programs, n_queries, d)
-        L = torch.zeros(Q.shape[:-1], device=Q.device, dtype=Q.dtype)    # (n_programs, n_queries)
-        n_programs = Q.shape[0]
-
-        if return_attn_probs:                                            # (n_programs, n_queries, n_keys)
-            S = torch.zeros((n_programs, n_queries, n_keys),  device=Q.device, dtype=Q.dtype)               
-
-        for pid in range(n_programs):
-            # Extract tensors for current batch element
-            q, k, v, o, l = Q[pid], K[pid], V[pid], O[pid], L[pid]  # (n_queries, d), (n_keys, d), (n_keys, d), (n_queries, d), (n_queries,)
-            
-            for i in range(Tq):
-                # Load query tile
-                Qi = q[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :]               # (Q_TILE_SIZE, d)
-                Oi = o[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :]               # (Q_TILE_SIZE, d)
-                li = l[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE]                  # (Q_TILE_SIZE,)
-                mi = torch.full((Q_TILE_SIZE,), -torch.inf, device=Q.device, dtype=Q.dtype)
-                                                                         # (Q_TILE_SIZE,) - initialized to -inf
-                for j in range(Tk):
-                    # Load key and value tiles
-                    Kj = k[j*K_TILE_SIZE:(j+1)*K_TILE_SIZE, :]           # (K_TILE_SIZE, d)
-                    Vj = v[j*K_TILE_SIZE:(j+1)*K_TILE_SIZE, :]           # (K_TILE_SIZE, d)
-
-                    # Step 1: Compute tile of pre-softmax attention scores
-                    # Sij: (Q_TILE_SIZE, K_TILE_SIZE) <- Qi @ Kj.T: (Q_TILE_SIZE, d) @ (d, K_TILE_SIZE)
-                    Sij = (Qi @ Kj.T) * scale
-                    if return_attn_probs: 
-                        S[pid, i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, j*K_TILE_SIZE:(j+1)*K_TILE_SIZE] = Sij
-
-                    # Step 2: Update running maximum
-                    # mi_next (fp32): (Q_TILE_SIZE,) <- mi (fp32): (Q_TILE_SIZE,), Sij: (Q_TILE_SIZE, K_TILE_SIZE)
-                    mi_next = torch.max(mi, Sij.max(dim=-1).values)
-
-                    # Step 3: Compute unnormalized softmax numerator
-                    # Pij (fp32): (Q_TILE_SIZE, K_TILE_SIZE) <- Sij: (Q_TILE_SIZE, K_TILE_SIZE), mi_next (fp32): (Q_TILE_SIZE,)
-                    Pij = torch.exp(Sij - mi_next[:, None])
-                    
-                    # Step 4: Update running denominator proxy
-                    # li_next (fp32): (Q_TILE_SIZE,) <- mi, mi_next, li: (Q_TILE_SIZE,)
-                    li_next = torch.exp(mi - mi_next) * li + Pij.sum(dim=-1)
-        
-                    # Step 5: Update output accumulator
-                    # Oi_next: (Q_TILE_SIZE, d) <- mi, mi_next: (Q_TILE_SIZE,), Oi: (Q_TILE_SIZE, d)
-                    #                           <- Pij: (Q_TILE_SIZE, K_TILE_SIZE), Vj: (K_TILE_SIZE, d)
-                    Oi_next = torch.exp(mi - mi_next)[:, None] * Oi + Pij @ Vj
-                    
-                    # Step 6: Update running values
-                    mi, li, Oi = mi_next, li_next, Oi_next
-
-                # Normalize output by final denominator
-                # Oi = (Q_TILE_SIZE, d) <- Oi / li[:, None]
-                Oi = Oi / li[:, None]
-                
-                # Compute logsumexp for backward pass
-                # Li = (Q_TILE_SIZE,) <- mi + log(li)
-                Li = mi + torch.log(li)
-
-                # Write tile results back
-                o[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :] = Oi
-                l[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE] = Li
-
-            # Write batch results back
-            L[pid], O[pid] = l, o
-        
-        # Reshape outputs to original shape
-        L = L.view(original_shape[:-1])  # (..., n_queries)
-        O = O.view(original_shape)       # (..., n_queries, d)
-
-        outputs = (S, O) if return_attn_probs else O
-        ctx.save_for_backward(L, Q, K, V, O)
-        return outputs
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        raise NotImplementedError
-
-class AttentionPytorch(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        Q: Float[Tensor, " ... queries d_k"],
-        K: Float[Tensor, " ... keys    d_k"],
-        V: Float[Tensor, " ... keys    d_v"],
-        is_causal: Bool = False,
-        return_attn_probs: Bool = False
-    ):
-        n_queries = Q.shape[-2]
-        n_keys = K.shape[-2]
-        d = Q.shape[-1]
-        scale = 1 / (d ** 0.5)
-
-        # Equation 4
-        S = einsum(Q, K, '... q d, ... k d -> ... q k') * scale
-        if is_causal:
-            S = torch.where(
-                torch.arange(n_queries, device=S.device)[None, :, None] >= 
-                torch.arange(n_keys, device=S.device)[None, None, :],
-                S, -1e6
-            )
-
-        # Equation 5
-        P = softmax(S, dim=-1)
-
-        # Equation 6
-        O = einsum(P, V, '... q k, ... k d -> ... q d')
-
-        # Equation 12
-        L = torch.logsumexp(S, dim=-1)
-        ctx.save_for_backward(L, Q, K, V, O)
-
-        outputs = (S, O) if return_attn_probs else O
-        return outputs
-        
-    @staticmethod
-    def backward(ctx, grad_out):
-        raise NotImplementedError
-
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -275,8 +134,21 @@ class FlashAttentionTriton(torch.autograd.Function):
             the appropriate dtype before writing it to global memory. Casting is done 
             with tensor.to. You can get the dtype of a tensor with tensor.dtype, and 
             the dtype of a block pointer/pointer with *_block_ptr.type.element_ty.
+        
+        Causal mask:
+            Add a flag as the last argument to your `autograd.Function` implementation for 
+            causal masking. This should be a boolean flag that when set to `True` enables an 
+            index comparison for causal masking. 
+            
+            Your Triton kernel should have a corresponding additional parameter 
+            `is_causal: tl.constexpr` (this is a required type annotation). In Triton, construct 
+            appropriate index vectors for queries and keys, and compare them to form a square 
+            mask of size $B_q \times B_k$. For elements that are masked out, add the constant 
+            value of `-1e6` to the corresponding elements of the attention score matrix $S_i^{(j)}$. 
+            
+            Make sure to save the mask flag for backward using `ctx.is_causal = is_causal`.
         """
-        logger.info("Running Flash Attention 2 Triton")
+        # logger.info("Running Flash Attention 2 Triton")
 
         n_queries = Q.shape[-2]
         n_keys = K.shape[-2]
@@ -309,7 +181,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             scale=scale,
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE
+            K_TILE_SIZE=K_TILE_SIZE,
+            is_causal=is_causal
         )
 
         # Reshape outputs to original shape
@@ -317,6 +190,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         O = O.view(original_shape)       # (..., n_queries, d)
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
         return O
         
     @staticmethod
@@ -336,7 +210,8 @@ def flash_fwd_kernel(
     scale,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     # Program indices
     query_tile_idx = tl.program_id(0)
@@ -388,7 +263,12 @@ def flash_fwd_kernel(
         block_shape=(Q_TILE_SIZE,),
         order=(0,)
     )
-    
+
+    # Construct index vectors
+    if is_causal: 
+        q_offsets = tl.arange(0, Q_TILE_SIZE) + query_tile_idx * Q_TILE_SIZE
+        k_offsets = tl.arange(0, K_TILE_SIZE)
+
     # Load query tile
     Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")     # (Q_TILE_SIZE, d)
     Oi = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)                           # (Q_TILE_SIZE, d) 
@@ -403,6 +283,10 @@ def flash_fwd_kernel(
 
         # Computation
         Sij        = tl.dot(Qi, Kj.T) * scale
+        if is_causal:
+            mask   = q_offsets[:, None] >= (k_offsets[None, :] + j * K_TILE_SIZE)
+            Sij    = Sij + tl.where(mask, 0, -1.0e6)
+            
         mi_next    = tl.maximum(mi, tl.max(Sij, axis=-1))
         Pij        = tl.exp(Sij - mi_next[:, None])
         li_next    = tl.exp(mi - mi_next) * li + tl.sum(Pij, axis=-1)
@@ -423,61 +307,3 @@ def flash_fwd_kernel(
     # Write tile results back
     tl.store(O_block_ptr, Oi.to(input_dtype), boundary_check=(0, 1))
     tl.store(L_block_ptr, Li.to(input_dtype), boundary_check=(0,))
-
-
-
-def _make_attn_inputs(
-    device=None,
-    dtype=torch.float32,
-    batch_size=8,
-    n_queries=512,
-    n_keys=512,
-    head_dim=64
-):
-    # torch.random.manual_seed(42)
-    q = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
-    do = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype)
-
-    return q, k, v, do
-
-if __name__ == "__main__":
-    Q, K, V, dO = _make_attn_inputs(device="cuda:0", dtype=torch.bfloat16)
-    
-    # Run all implementations
-    S_ref, O_ref = AttentionPytorch.apply(Q, K, V, False, True)
-    S_debug, O_debug = FlashAttentionPytorch.apply(Q, K, V, False, True)
-    O_triton = FlashAttentionTriton.apply(Q, K, V, False)
-    
-    # Extract L values
-    L_ref = O_ref.grad_fn.saved_tensors[0]
-    L_debug = O_debug.grad_fn.saved_tensors[0]
-    L_triton = O_triton.grad_fn.saved_tensors[0]
-    
-    # Log all outputs
-    logger.info(f"S_ref: {S_ref}")
-    logger.info(f"L_ref: {L_ref}")
-    logger.info(f"O_ref: {O_ref}")
-    logger.info("-" * 50)
-    logger.info(f"S_debug: {S_debug}")
-    logger.info(f"L_debug: {L_debug}")
-    logger.info(f"O_debug: {O_debug}")
-    logger.info("-" * 50)
-    logger.info(f"L_triton: {L_triton}")
-    logger.info(f"O_triton: {O_triton}")
-        
-    # Test PyTorch debug vs reference
-    logger.info("Testing PyTorch debug implementation...")
-    torch.testing.assert_close(S_ref, S_debug, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(L_ref, L_debug, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(O_ref, O_debug, rtol=1e-2, atol=1e-2)
-    logger.info("✓ PyTorch debug matches reference")
-    
-    # Test Triton vs reference
-    logger.info("Testing Triton implementation...")
-    torch.testing.assert_close(O_triton, O_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(L_triton, L_ref, rtol=1e-2, atol=1e-2)
-    logger.info("✓ Triton matches reference")
-    
-    logger.info("✓ All tests passed!")

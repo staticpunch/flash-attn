@@ -1,6 +1,21 @@
 import torch
+import logging
 
+## common utils
+def setup_logging(name, log_level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(getattr(logging, log_level.upper()))
+    logger.handlers.clear()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
 
+## nn_utils
 def softmax(x, dim=-1):
     rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
     exponentiated_rescaled_input = torch.exp(rescaled_input)

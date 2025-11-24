@@ -13,32 +13,16 @@ import torch.nn as nn
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
 from jaxtyping import Float, Bool, Int
-from .nn_utils import softmax
+from ..utils import softmax
+from ..utils import setup_logging
 
-logger = logging.getLogger("attention_impl")
+logger = setup_logging("attention_impl")
 
 def copy_docstring(source_func):
     def wrapper(target_func):
         target_func.__doc__ = source_func.__doc__
         return target_func
     return wrapper
-
-
-def _make_attn_inputs(
-    device=None,
-    dtype=torch.float32,
-    batch_size=8,
-    n_queries=128,
-    n_keys=128,
-    head_dim=64
-):
-    torch.random.manual_seed(0)
-    q = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
-    do = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype)
-
-    return q, k, v, do
 
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
